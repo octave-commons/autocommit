@@ -1,4 +1,5 @@
 import chokidar from 'chokidar';
+import ioPkg from '@pm2/io';
 import pc from 'picocolors';
 
 import { Config } from './config.js';
@@ -54,6 +55,71 @@ function createLogger(): { log: (s: string) => void; warn: (s: string) => void }
   const warn = (s: string) => console.warn(pc.yellow(`[autocommit] ${s}`));
   return { log, warn };
 }
+
+type Pm2ActionFn = (name: string, handler: (reply: (payload: Record<string, unknown>) => void) => void) => void;
+
+type Pm2Module = {
+  readonly action?: Pm2ActionFn;
+  readonly default?: {
+    readonly action?: Pm2ActionFn;
+  };
+};
+
+const pm2Module = ioPkg as Pm2Module;
+const pm2Action = pm2Module?.action ?? pm2Module?.default?.action;
+
+const registerPm2Action = (
+  name: string,
+  handler: () => Promise<Record<string, unknown> | void> | Record<string, unknown> | void,
+): void => {
+  if (!pm2Action) {
+    return;
+  }
+
+  pm2Action(name, async (reply) => {
+    try {
+      const result = await handler();
+      reply({ success: true, ...(result ?? {}) });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      reply({ success: false, error: message });
+    }
+  });
+};
+
+type ServiceController = {
+  readonly runNow: (force?: boolean) => Promise<'skipped' | 'ran'>;
+  readonly pause: () => void;
+  readonly resume: () => void;
+  readonly status: () => 'paused' | 'running';
+};
+
+let activeController: ServiceController | null = null;
+
+function ensureController(): ServiceController {
+  if (!activeController) {
+    throw new AutocommitError('Autocommit service has not finished initializing');
+  }
+  return activeController;
+}
+
+registerPm2Action('sync-now', async () => {
+  const controller = ensureController();
+  const result = await controller.runNow(true);
+  return { state: controller.status(), result };
+});
+
+registerPm2Action('pause', () => {
+  const controller = ensureController();
+  controller.pause();
+  return { state: controller.status() };
+});
+
+registerPm2Action('resume', () => {
+  const controller = ensureController();
+  controller.resume();
+  return { state: controller.status() };
+});
 
 function categorizeError(err: unknown): string {
   if (err instanceof Error && err.name === 'AbortError') {
@@ -180,8 +246,16 @@ function createScheduler(
   root: string,
   log: (msg: string) => void,
   warn: (msg: string) => void,
-): { schedule: () => Promise<void>; cleanup: () => void } {
+): {
+  schedule: () => Promise<void>;
+  cleanup: () => void;
+  runNow: (force?: boolean) => Promise<'skipped' | 'ran'>;
+  pause: () => void;
+  resume: () => void;
+  isPaused: () => boolean;
+} {
   let timer: NodeJS.Timeout | null = null;
+  let paused = false;
 
   const cleanup = () => {
     if (timer) {
@@ -190,14 +264,27 @@ function createScheduler(
     }
   };
 
+  const executeCommit = async (force: boolean): Promise<'skipped' | 'ran'> => {
+    if (paused && !force) {
+      return 'skipped';
+    }
+
+    await performCommit(config, root, log, warn);
+    return 'ran';
+  };
+
   const schedule = (): Promise<void> => {
+    if (paused) {
+      return Promise.resolve();
+    }
+
     cleanup();
     return new Promise<void>((resolve) => {
       timer = setTimeout(() => {
         void (async () => {
           timer = null;
           try {
-            await performCommit(config, root, log, warn);
+            await executeCommit(false);
           } catch (e: unknown) {
             const errorMessage = e instanceof Error ? e.message : String(e);
             warn(`Commit cycle error: ${errorMessage}`);
@@ -208,7 +295,31 @@ function createScheduler(
     });
   };
 
-  return { schedule, cleanup };
+  const runNow = async (force = false): Promise<'skipped' | 'ran'> => {
+    cleanup();
+    return executeCommit(force);
+  };
+
+  const pause = (): void => {
+    if (paused) {
+      return;
+    }
+    paused = true;
+    cleanup();
+    log('Autocommit paused');
+  };
+
+  const resume = (): void => {
+    if (!paused) {
+      return;
+    }
+    paused = false;
+    log('Autocommit resumed');
+  };
+
+  const isPaused = (): boolean => paused;
+
+  return { schedule, cleanup, runNow, pause, resume, isPaused };
 }
 
 /**
@@ -229,15 +340,26 @@ export async function start(config: Config): Promise<{ close: () => void }> {
   const { log, warn } = createLogger();
   const ignored = getIgnoredPaths(config);
 
-  const { schedule, cleanup } = createScheduler(config, root, log, warn);
-  const watcherSetup = setupWatcher(root, ignored, { schedule, log, warn });
+  const scheduler = createScheduler(config, root, log, warn);
+  const watcherSetup = setupWatcher(root, ignored, { schedule: scheduler.schedule, log, warn });
+
+  const startController: ServiceController = {
+    runNow: (force = false) => scheduler.runNow(force),
+    pause: scheduler.pause,
+    resume: scheduler.resume,
+    status: () => (scheduler.isPaused() ? 'paused' : 'running'),
+  };
+  activeController = startController;
 
   log(`Watching ${root} (debounce ${config.debounceMs}ms). Ignored: ${ignored.join(', ')}`);
 
   return {
     close: () => {
-      cleanup();
+      scheduler.cleanup();
       watcherSetup.close();
+      if (activeController === startController) {
+        activeController = null;
+      }
     },
   };
 }
