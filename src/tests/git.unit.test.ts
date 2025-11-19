@@ -14,6 +14,8 @@ import {
   repoSummary,
   commit,
   sanitizeCommitMessage,
+  listSubmodulePaths,
+  collectSubmodules,
 } from '../git.ts';
 
 // Helper to create unique temp directory names
@@ -204,11 +206,106 @@ test('repoSummary returns branch and remote info', async (t) => {
     await execa('git', ['init'], { cwd: tempDir });
     await execa('git', ['config', 'user.name', 'Test User'], { cwd: tempDir });
     await execa('git', ['config', 'user.email', 'test@example.com'], { cwd: tempDir });
+    await execa('git', ['remote', 'add', 'origin', 'git@example.com:repo.git'], {
+      cwd: tempDir,
+    });
+    await writeFile(join(tempDir, 'readme.md'), '# temp');
+    await execa('git', ['add', '.'], { cwd: tempDir });
+    await execa('git', ['commit', '-m', 'init'], { cwd: tempDir });
 
     const summary = await repoSummary(tempDir);
-    t.true(summary.includes('branch:'));
-    t.true(summary.includes('remote:'));
+    t.regex(summary, /branch: (master|main); remote:/);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('listSubmodulePaths returns submodules from .gitmodules', async (t) => {
+  const baseDir = getTempDir();
+  const subDir = join(baseDir, 'sub');
+  const mainDir = join(baseDir, 'main');
+  await mkdir(subDir, { recursive: true });
+  await mkdir(mainDir, { recursive: true });
+
+  try {
+    // create submodule repo
+    await execa('git', ['init'], { cwd: subDir });
+    await execa('git', ['config', 'user.name', 'Test User'], { cwd: subDir });
+    await execa('git', ['config', 'user.email', 'test@example.com'], { cwd: subDir });
+    await writeFile(join(subDir, 'a.txt'), 'a');
+    await execa('git', ['add', '.'], { cwd: subDir });
+    await execa('git', ['commit', '-m', 'init sub'], { cwd: subDir });
+
+    // main repo
+    await execa('git', ['init'], { cwd: mainDir });
+    await execa('git', ['config', 'user.name', 'Test User'], { cwd: mainDir });
+    await execa('git', ['config', 'user.email', 'test@example.com'], { cwd: mainDir });
+    await execa(
+      'git',
+      ['-c', 'protocol.file.allow=always', 'submodule', 'add', subDir, 'deps/sub'],
+      {
+        cwd: mainDir,
+      },
+    );
+
+    const subs = await listSubmodulePaths(mainDir);
+    t.deepEqual(subs, [join(mainDir, 'deps/sub')]);
+  } finally {
+    await rm(baseDir, { recursive: true, force: true });
+  }
+});
+
+test('collectSubmodules walks nested submodules', async (t) => {
+  const baseDir = getTempDir();
+  const leafDir = join(baseDir, 'leaf');
+  const midDir = join(baseDir, 'mid');
+  const rootDir = join(baseDir, 'root');
+  await mkdir(leafDir, { recursive: true });
+  await mkdir(midDir, { recursive: true });
+  await mkdir(rootDir, { recursive: true });
+
+  try {
+    // leaf repo
+    await execa('git', ['init'], { cwd: leafDir });
+    await execa('git', ['config', 'user.name', 'Test User'], { cwd: leafDir });
+    await execa('git', ['config', 'user.email', 'test@example.com'], { cwd: leafDir });
+    await writeFile(join(leafDir, 'leaf.txt'), 'leaf');
+    await execa('git', ['add', '.'], { cwd: leafDir });
+    await execa('git', ['commit', '-m', 'leaf'], { cwd: leafDir });
+
+    // mid repo with leaf submodule
+    await execa('git', ['init'], { cwd: midDir });
+    await execa('git', ['config', 'user.name', 'Test User'], { cwd: midDir });
+    await execa('git', ['config', 'user.email', 'test@example.com'], { cwd: midDir });
+    await writeFile(join(midDir, 'mid.txt'), 'mid');
+    await execa('git', ['add', '.'], { cwd: midDir });
+    await execa('git', ['commit', '-m', 'mid'], { cwd: midDir });
+    await execa(
+      'git',
+      ['-c', 'protocol.file.allow=always', 'submodule', 'add', leafDir, 'nested/leaf'],
+      { cwd: midDir },
+    );
+    await execa('git', ['add', '.'], { cwd: midDir });
+    await execa('git', ['commit', '-m', 'add leaf submodule'], { cwd: midDir });
+
+    // root repo with mid submodule
+    await execa('git', ['init'], { cwd: rootDir });
+    await execa('git', ['config', 'user.name', 'Test User'], { cwd: rootDir });
+    await execa('git', ['config', 'user.email', 'test@example.com'], { cwd: rootDir });
+    await execa(
+      'git',
+      ['-c', 'protocol.file.allow=always', 'submodule', 'add', midDir, 'deps/mid'],
+      {
+        cwd: rootDir,
+      },
+    );
+    await execa('git', ['add', '.'], { cwd: rootDir });
+    await execa('git', ['commit', '-m', 'add mid submodule'], { cwd: rootDir });
+
+    const subs = await collectSubmodules(rootDir);
+    t.true(subs.includes(join(rootDir, 'deps/mid')));
+    t.true(subs.includes(join(rootDir, 'deps/mid/nested/leaf')));
+  } finally {
+    await rm(baseDir, { recursive: true, force: true });
   }
 });

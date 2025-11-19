@@ -1,3 +1,4 @@
+import { resolve as resolvePath } from 'path';
 import { execa } from 'execa';
 
 export async function gitRoot(cwd: string): Promise<string> {
@@ -12,6 +13,45 @@ export async function hasRepo(cwd: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+export async function listSubmodulePaths(cwd: string): Promise<string[]> {
+  try {
+    const { stdout } = await execa(
+      'git',
+      ['config', '--file', '.gitmodules', '--get-regexp', 'path'],
+      {
+        cwd,
+      },
+    );
+    if (!stdout.trim()) return [];
+    return stdout
+      .trim()
+      .split('\n')
+      .map((line) => {
+        const parts = line.trim().split(/\s+/);
+        return parts[parts.length - 1] ?? '';
+      })
+      .filter(Boolean)
+      .map((p) => resolvePath(cwd, p));
+  } catch {
+    return [];
+  }
+}
+
+export async function collectSubmodules(cwd: string): Promise<string[]> {
+  const seen = new Set<string>();
+
+  const walk = async (dir: string): Promise<void> => {
+    for (const sub of await listSubmodulePaths(dir)) {
+      if (seen.has(sub)) continue;
+      seen.add(sub);
+      await walk(sub);
+    }
+  };
+
+  await walk(cwd);
+  return Array.from(seen);
 }
 
 export async function statusPorcelain(cwd: string): Promise<string> {

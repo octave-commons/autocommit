@@ -5,6 +5,7 @@ import pc from 'picocolors';
 import { Config } from './config.js';
 import {
   addAll,
+  collectSubmodules,
   commit,
   gitRoot,
   hasRepo,
@@ -56,7 +57,10 @@ function createLogger(): { log: (s: string) => void; warn: (s: string) => void }
   return { log, warn };
 }
 
-type Pm2ActionFn = (name: string, handler: (reply: (payload: Record<string, unknown>) => void) => void) => void;
+type Pm2ActionFn = (
+  name: string,
+  handler: (reply: (payload: Record<string, unknown>) => void) => void,
+) => void;
 
 type Pm2Module = {
   readonly action?: Pm2ActionFn;
@@ -339,24 +343,50 @@ export async function start(config: Config): Promise<{ close: () => void }> {
   const root = await gitRoot(cwd);
   const { log, warn } = createLogger();
   const ignored = getIgnoredPaths(config);
+  const submodules = await collectSubmodules(root);
+  const repoRoots = [root, ...submodules];
 
-  const scheduler = createScheduler(config, root, log, warn);
-  const watcherSetup = setupWatcher(root, ignored, { schedule: scheduler.schedule, log, warn });
+  const contexts = repoRoots.map((repoRoot) => {
+    const label = repoRoot === root ? 'root' : `submodule:${repoRoot}`;
+    const taggedLog = (msg: string) => log(`[${label}] ${msg}`);
+    const taggedWarn = (msg: string) => warn(`[${label}] ${msg}`);
+    const scheduler = createScheduler(config, repoRoot, taggedLog, taggedWarn);
+    const watcherSetup = setupWatcher(repoRoot, ignored, {
+      schedule: scheduler.schedule,
+      log: taggedLog,
+      warn: taggedWarn,
+    });
+    taggedLog(
+      `Watching ${repoRoot} (debounce ${config.debounceMs}ms). Ignored: ${ignored.join(', ')}`,
+    );
+    return { repoRoot, scheduler, watcherSetup };
+  });
 
-  const startController: ServiceController = {
-    runNow: (force = false) => scheduler.runNow(force),
-    pause: scheduler.pause,
-    resume: scheduler.resume,
-    status: () => (scheduler.isPaused() ? 'paused' : 'running'),
+  const runNow = async (force = false): Promise<'skipped' | 'ran'> => {
+    const results = await Promise.all(contexts.map(({ scheduler }) => scheduler.runNow(force)));
+    return results.some((r) => r === 'ran') ? 'ran' : 'skipped';
   };
-  activeController = startController;
 
-  log(`Watching ${root} (debounce ${config.debounceMs}ms). Ignored: ${ignored.join(', ')}`);
+  const pause = (): void => {
+    contexts.forEach(({ scheduler }) => scheduler.pause());
+  };
+
+  const resume = (): void => {
+    contexts.forEach(({ scheduler }) => scheduler.resume());
+  };
+
+  const status = (): 'paused' | 'running' =>
+    contexts.every(({ scheduler }) => scheduler.isPaused()) ? 'paused' : 'running';
+
+  const startController: ServiceController = { runNow, pause, resume, status };
+  activeController = startController;
 
   return {
     close: () => {
-      scheduler.cleanup();
-      watcherSetup.close();
+      contexts.forEach(({ scheduler, watcherSetup }) => {
+        scheduler.cleanup();
+        watcherSetup.close();
+      });
       if (activeController === startController) {
         activeController = null;
       }

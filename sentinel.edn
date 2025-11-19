@@ -1,0 +1,4 @@
+{:watchers {:autocommit {:path "."
+                           :ignored ["**/node_modules/**" "**/.git/**" "**/dist/**"]
+                           :synthetic [{:id :autocommit-source :on :any :glob "src/**/*.{ts,tsx,js,mjs,cjs}"}
+                                       {:id :autocommit-config :on :change :glob "sentinel.edn"}]}}}
